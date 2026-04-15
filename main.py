@@ -13,7 +13,7 @@ from typing import Dict, Any, Optional
 from docx import Document
 from docx.shared import Pt
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, constants
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -421,6 +421,7 @@ async def process_after_spec_context(
     custom_context: Optional[str],
 ):
     """Transcribe (if needed) and format as spec with optional custom context."""
+    loop = asyncio.get_event_loop()
     try:
         if spec_state["mode"] == "initial":
             tmp_path = spec_state["path"]
@@ -428,7 +429,7 @@ async def process_after_spec_context(
                 f"✅ Шаблон: {TEMPLATES['spec']['name']}\n⏳ Транскрибирую аудио…"
             )
             try:
-                transcript = transcribe_audio(tmp_path)
+                transcript = await loop.run_in_executor(None, transcribe_audio, tmp_path)
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -447,7 +448,9 @@ async def process_after_spec_context(
 
         if ANTHROPIC_API_KEY:
             try:
-                formatted = format_with_claude("spec", transcript, custom_context)
+                formatted = await loop.run_in_executor(
+                    None, format_with_claude, "spec", transcript, custom_context
+                )
             except Exception as e:
                 logger.exception("Claude failed")
                 await bot.send_message(chat_id=chat_id, text=f"⚠️ Claude ошибка: {e}\n\nСырой транскрипт:")
@@ -493,8 +496,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp.close()
 
         status = await message.reply_text("⏳ Транскрибирую контекст…")
+        loop = asyncio.get_event_loop()
         try:
-            ctx_text = transcribe_audio(tmp.name)
+            ctx_text = await loop.run_in_executor(None, transcribe_audio, tmp.name)
         except Exception as exc:
             await status.edit_text(f"❌ Не удалось транскрибировать контекст: {exc}")
             return
@@ -606,9 +610,10 @@ async def handle_template_selection(update: Update, context: ContextTypes.DEFAUL
 
 async def _run_standard_template(query, bot, user_id: str, template_id: str, tmp_path: str):
     template = TEMPLATES[template_id]
+    loop = asyncio.get_event_loop()
     try:
         await query.edit_message_text(f"✅ Шаблон: {template['name']}\n⏳ Транскрибирую…")
-        transcript = transcribe_audio(tmp_path)
+        transcript = await loop.run_in_executor(None, transcribe_audio, tmp_path)
 
         if not transcript.strip():
             await query.edit_message_text("❌ Deepgram не смог распознать речь. Попробуй снова.")
@@ -620,7 +625,7 @@ async def _run_standard_template(query, bot, user_id: str, template_id: str, tmp
 
         if ANTHROPIC_API_KEY:
             try:
-                formatted = format_with_claude(template_id, transcript)
+                formatted = await loop.run_in_executor(None, format_with_claude, template_id, transcript)
             except Exception as e:
                 logger.exception("Claude failed")
                 await bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ Claude ошибка: {e}\n\nСырой транскрипт:")
@@ -752,9 +757,10 @@ async def handle_reformat_selection(update: Update, context: ContextTypes.DEFAUL
         return
 
     await query.edit_message_text(f"⏳ Переформатирую как {template['name']}…")
+    loop = asyncio.get_event_loop()
     try:
         if ANTHROPIC_API_KEY:
-            formatted = format_with_claude(template_id, transcript)
+            formatted = await loop.run_in_executor(None, format_with_claude, template_id, transcript)
         else:
             formatted = transcript
         await query.edit_message_text(f"✅ Переформатировано: {template['name']}")
@@ -782,7 +788,13 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_action, pattern=r"^action:"))
 
     logger.info("Bot is running…")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=[
+            Update.MESSAGE,
+            Update.CALLBACK_QUERY,
+        ],
+    )
 
 
 if __name__ == "__main__":
