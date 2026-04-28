@@ -8,6 +8,7 @@ import asyncio
 import os
 import logging
 import tempfile
+import subprocess
 from typing import Dict, Any, Optional
 
 from docx import Document
@@ -24,6 +25,7 @@ from telegram.ext import (
 )
 from deepgram import DeepgramClient, DeepgramClientOptions, PrerecordedOptions, FileSource
 import anthropic
+from pyrogram import Client as PyroClient
 
 load_dotenv()
 
@@ -36,6 +38,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8385003837:AAGcZz-LP5exdsFy4i5mn578RRey-6mJcRM")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "8b296b68246aaa4e5468512f972a4d9ea90dfb8a")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
@@ -48,6 +52,35 @@ pending_spec_context: Dict[str, Dict[str, Any]] = {}
 # user_id -> {formatted, template_name, transcript}  — last processed result
 last_result: Dict[str, Dict[str, Any]] = {}
 
+
+
+# ─── Pyrogram client (large file downloads) ───────────────────────────────────
+
+_pyro: Optional[PyroClient] = None
+
+
+async def get_pyro() -> PyroClient:
+    global _pyro
+    if _pyro is None:
+        _pyro = PyroClient(
+            "voicetotext_dl",
+            api_id=TELEGRAM_API_ID,
+            api_hash=TELEGRAM_API_HASH,
+            bot_token=TELEGRAM_BOT_TOKEN,
+            workdir="/root/voicetotext",
+            no_updates=True,
+        )
+        await _pyro.start()
+    return _pyro
+
+
+async def download_large_file(chat_id: int, message_id: int, suffix: str) -> str:
+    client = await get_pyro()
+    msg = await client.get_messages(chat_id, message_id)
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.close()
+    await client.download_media(msg, file_name=tmp.name)
+    return tmp.name
 
 # ─── Templates ────────────────────────────────────────────────────────────────
 
@@ -307,6 +340,26 @@ async def send_long_message(chat_id: int, text: str, bot) -> Message:
     return last
 
 
+
+def extract_audio(input_path: str) -> str:
+    out = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    out.close()
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", input_path,
+            "-vn",
+            "-acodec", "libopus",
+            "-b:a", "32k",
+            "-ar", "16000",
+            out.name,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return out.name
+
+
 def transcribe_audio(tmp_path: str) -> str:
     deepgram = DeepgramClient(
         DEEPGRAM_API_KEY,
@@ -429,12 +482,17 @@ async def process_after_spec_context(
                 f"✅ Шаблон: {TEMPLATES['spec']['name']}\n⏳ Транскрибирую аудио…"
             )
             try:
-                transcript = await loop.run_in_executor(None, transcribe_audio, tmp_path)
+                compressed_path = await loop.run_in_executor(None, extract_audio, tmp_path)
+            except Exception:
+                compressed_path = tmp_path
+            try:
+                transcript = await loop.run_in_executor(None, transcribe_audio, compressed_path)
             finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+                for p in set([tmp_path, compressed_path]):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
         else:
             transcript = spec_state["transcript"]
 
@@ -471,7 +529,7 @@ async def process_after_spec_context(
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Отправь мне аудиофайл (MP3, WAV, OGG) или голосовое сообщение, "
+        "👋 Привет! Отправь мне аудиофайл (MP3, WAV, OGG, WEBM) или голосовое сообщение, "
         "и я транскрибирую его с помощью Deepgram.\n\n"
         "После загрузки выбери шаблон оформления текста."
     )
@@ -485,6 +543,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "audio/mpeg", "audio/mp3",
         "audio/wav", "audio/wave", "audio/x-wav",
         "audio/ogg", "audio/opus",
+        "audio/webm", "video/webm",
     }
 
     # Audio received while waiting for spec context voice → treat as context voice
@@ -521,18 +580,45 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Normal audio upload
+    MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram bot limit
+
     if message.audio:
-        tg_file = await message.audio.get_file()
-        filename = message.audio.file_name or "audio.mp3"
+        media = message.audio
+        filename = media.file_name or "audio.mp3"
     elif message.voice:
-        tg_file = await message.voice.get_file()
+        media = message.voice
         filename = "voice.ogg"
+    elif message.video:
+        media = message.video
+        filename = media.file_name or "video.webm"
     elif message.document and message.document.mime_type in SUPPORTED_MIME:
-        tg_file = await message.document.get_file()
-        filename = message.document.file_name or "audio.mp3"
+        media = message.document
+        filename = media.file_name or "audio.mp3"
     else:
-        await message.reply_text("⚠️ Пожалуйста, отправь аудиофайл MP3, WAV или голосовое сообщение.")
+        await message.reply_text("⚠️ Пожалуйста, отправь аудиофайл MP3, WAV, OGG, WEBM или голосовое сообщение.")
         return
+
+    if media.file_size and media.file_size > MAX_FILE_SIZE:
+        size_mb = media.file_size / 1024 / 1024
+        status = await message.reply_text(
+            f"📦 Файл {size_mb:.1f} МБ — скачиваю через расширенный режим…"
+        )
+        suffix = os.path.splitext(filename)[-1] or ".webm"
+        try:
+            tmp_path = await download_large_file(message.chat_id, message.message_id, suffix)
+        except Exception as exc:
+            logger.exception("Pyrogram download failed")
+            await status.edit_text(f"❌ Не удалось скачать файл: {exc}")
+            return
+        await status.edit_text("✅ Файл получен! Выбери шаблон оформления:")
+        pending_audio[user_id] = {"path": tmp_path, "filename": filename}
+        await status.edit_text(
+            "✅ Файл получен! Выбери шаблон оформления:",
+            reply_markup=build_template_keyboard(user_id),
+        )
+        return
+
+    tg_file = await media.get_file()
 
     status = await message.reply_text("⏳ Загружаю файл…")
     suffix = os.path.splitext(filename)[-1] or ".mp3"
@@ -612,8 +698,18 @@ async def _run_standard_template(query, bot, user_id: str, template_id: str, tmp
     template = TEMPLATES[template_id]
     loop = asyncio.get_event_loop()
     try:
+        await query.edit_message_text(f"✅ Шаблон: {template['name']}\n⏳ Извлекаю аудио…")
+        try:
+            compressed_path = await loop.run_in_executor(None, extract_audio, tmp_path)
+        except Exception:
+            compressed_path = tmp_path
         await query.edit_message_text(f"✅ Шаблон: {template['name']}\n⏳ Транскрибирую…")
-        transcript = await loop.run_in_executor(None, transcribe_audio, tmp_path)
+        transcript = await loop.run_in_executor(None, transcribe_audio, compressed_path)
+        if compressed_path != tmp_path:
+            try:
+                os.unlink(compressed_path)
+            except OSError:
+                pass
 
         if not transcript.strip():
             await query.edit_message_text("❌ Deepgram не смог распознать речь. Попробуй снова.")
@@ -778,7 +874,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(
-        filters.AUDIO | filters.VOICE | filters.Document.AUDIO,
+        filters.AUDIO | filters.VOICE | filters.VIDEO | filters.Document.AUDIO | filters.Document.VIDEO,
         handle_audio,
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
