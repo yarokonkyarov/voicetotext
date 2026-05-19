@@ -9,6 +9,7 @@ import os
 import logging
 import tempfile
 import subprocess
+import httpx
 from typing import Dict, Any, Optional
 
 from docx import Document
@@ -422,7 +423,6 @@ def extract_audio(input_path: str) -> str:
 def transcribe_audio(tmp_path: str) -> str:
     deepgram = DeepgramClient(
         DEEPGRAM_API_KEY,
-        DeepgramClientOptions(options={"timeout": 300}),
     )
     with open(tmp_path, "rb") as f:
         buffer_data = f.read()
@@ -762,7 +762,11 @@ async def _run_standard_template(query, bot, user_id: str, template_id: str, tmp
             compressed_path = await loop.run_in_executor(None, extract_audio, tmp_path)
         except Exception:
             compressed_path = tmp_path
-        await query.edit_message_text(f"✅ Шаблон: {template['name']}\n⏳ Транскрибирую…")
+        file_size_mb = os.path.getsize(compressed_path) / 1024 / 1024
+        est_min = max(1, int(file_size_mb / 2))
+        await query.edit_message_text(
+            f"✅ Шаблон: {template['name']}\n⏳ Транскрибирую… Примерное время: {est_min}–{est_min*2} мин. Ожидайте."
+        )
         transcript = await loop.run_in_executor(None, transcribe_audio, compressed_path)
         if compressed_path != tmp_path:
             try:
