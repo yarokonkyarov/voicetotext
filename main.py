@@ -118,6 +118,14 @@ TEMPLATES: Dict[str, Dict[str, str]] = {
         "name": "✉️ Письмо",
         "description": "Голос → готовое письмо с темой и структурой",
     },
+    "sales_coaching": {
+        "name": "🎯 Оценка звонка",
+        "description": "Коучинг по 5 этапам: знакомство, квалификация, презентация, возражения, закрытие",
+    },
+    "client_meeting": {
+        "name": "📋 Client Meeting Notes",
+        "description": "Notitie met klantbehoefte, producten, voorwaarden en vervolgacties",
+    },
 }
 
 TEMPLATE_PROMPTS: Dict[str, str] = {
@@ -262,6 +270,72 @@ TEMPLATE_PROMPTS: Dict[str, str] = {
 {transcript}
 
 Верни только заметку о звонке. Никаких пояснений.""",
+
+    "sales_coaching": """You are an expert sales coach. Analyze the transcript below and produce a structured call evaluation report in the same language as the transcript.
+
+## 🎯 Sales Call Evaluation
+
+### 1. Introduction
+**Score:** ⭐⭐⭐⭐⭐ (X/5)
+[How did the agent open the call? First impression, tone, clarity of purpose]
+
+### 2. Qualifying Questions
+**Score:** ⭐⭐⭐⭐⭐ (X/5)
+[Did the agent ask the right questions to understand customer needs and build rapport?]
+
+### 3. Presentation
+**Score:** ⭐⭐⭐⭐⭐ (X/5)
+[How well did the agent present the product/service, key features, and promotions?]
+
+### 4. Objection Handling & Sales Tactics
+**Score:** ⭐⭐⭐⭐⭐ (X/5)
+[How did the agent handle objections? What sales techniques were used?]
+
+### 5. Closing
+**Score:** ⭐⭐⭐⭐⭐ (X/5)
+[Did the agent attempt to close? Was the closing technique effective?]
+
+---
+
+### ✅ Strengths
+- ...
+
+### 📈 Areas for Improvement
+- ...
+
+### 💬 Overall Coaching Summary
+[2–3 sentences on overall performance and key focus for next call]
+
+---
+Transcript:
+{transcript}
+
+Return only the evaluation report. No extra commentary.""",
+
+    "client_meeting": """Ты опытный аккаунт-менеджер. Составь структурированную заметку о встрече с клиентом на основе транскрипта ниже.
+
+## 📋 Встреча с клиентом — [название компании] — [дата]
+
+### Потребность клиента
+[Чего хочет достичь клиент? Какую проблему нужно решить?]
+
+### Обсуждаемые продукты / услуги
+- ...
+
+### Технические требования и условия
+- ...
+
+### Возражения и важные моменты
+- ...
+
+### Договорённости и следующие шаги
+- [ ] Действие — Ответственный — Срок
+
+---
+Транскрипт:
+{transcript}
+
+Верни только заметку. Никаких пояснений.""",
 
     "email": """Ты профессиональный бизнес-копирайтер. Преобразуй транскрипт ниже в готовое деловое письмо на русском языке.
 
