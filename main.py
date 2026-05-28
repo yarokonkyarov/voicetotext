@@ -9,6 +9,7 @@ import os
 import logging
 import tempfile
 import subprocess
+from datetime import datetime
 import httpx
 from typing import Dict, Any, Optional
 
@@ -457,7 +458,10 @@ def build_template_keyboard(user_id: str, prefix: str = "tpl") -> InlineKeyboard
 def build_action_keyboard(user_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Другой шаблон", callback_data=f"action:reformat:{user_id}")],
-        [InlineKeyboardButton("📄 Скачать DOCX", callback_data=f"action:docx:{user_id}")],
+        [
+            InlineKeyboardButton("📄 DOCX", callback_data=f"action:docx:{user_id}"),
+            InlineKeyboardButton("📝 Markdown", callback_data=f"action:md:{user_id}"),
+        ],
     ])
 
 
@@ -533,11 +537,12 @@ def format_with_claude(template_id: str, transcript: str, custom_context: Option
     return response.content[0].text
 
 
-def create_docx(template_name: str, formatted_text: str) -> str:
+def create_docx(template_name: str, formatted_text: str, source_filename: str = "") -> str:
     """Convert formatted text to .docx. Returns temp file path."""
     doc = Document()
 
-    title = doc.add_heading(template_name, level=0)
+    doc_title = f"{template_name} — {source_filename}" if source_filename else template_name
+    title = doc.add_heading(doc_title, level=0)
     title.runs[0].font.size = Pt(18)
 
     for line in formatted_text.splitlines():
@@ -575,6 +580,7 @@ async def deliver_result(
     template_id: str,
     transcript: str,
     formatted: str,
+    source_filename: str = "",
 ):
     """Send formatted result and store it with action buttons."""
     template_name = TEMPLATES[template_id]["name"]
@@ -584,9 +590,14 @@ async def deliver_result(
         "formatted": formatted,
         "template_id": template_id,
         "template_name": template_name,
+        "source_filename": source_filename,
     }
 
-    header = f"🎙 {template_name}\n{'─' * 32}\n\n"
+    header_parts = [f"🎙 {template_name}"]
+    if source_filename:
+        header_parts.append(f"📎 {source_filename}")
+    header_parts.append("─" * 32)
+    header = "\n".join(header_parts) + "\n\n"
     await send_long_message(chat_id=chat_id, text=header + formatted, bot=bot)
     await bot.send_message(
         chat_id=chat_id,
@@ -594,6 +605,49 @@ async def deliver_result(
         reply_markup=build_action_keyboard(user_id),
     )
 
+
+
+
+# Tag mapping per template
+TEMPLATE_TAGS = {
+    "meeting":        ["встреча", "протокол"],
+    "action_items":   ["задачи", "action-items"],
+    "summary":        ["резюме", "summary"],
+    "spec":           ["тех-задание", "spec"],
+    "client_call":    ["клиент", "звонок", "crm"],
+    "email":          ["письмо", "email"],
+    "sales_coaching": ["продажи", "коучинг", "оценка-звонка"],
+    "client_meeting": ["клиент", "встреча", "crm"],
+}
+
+
+def create_md(template_id: str, template_name: str, formatted_text: str, source_filename: str = "") -> str:
+    """Generate Obsidian-compatible Markdown file. Returns temp file path."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    clean_name = template_name.lstrip("📋📞✉️🎯📐🔖📝 ")  # strip emoji for tags
+
+    # Build YAML frontmatter
+    tags = ["voicetotext"] + TEMPLATE_TAGS.get(template_id, [])
+    tags_yaml = "\n".join(f"  - {t}" for t in tags)
+
+    title = f"{clean_name} — {source_filename}" if source_filename else clean_name
+
+    frontmatter = (
+        f"---\n"
+        f"title: \"{title}\"\n"
+        f"date: {today}\n"
+        f"tags:\n{tags_yaml}\n"
+        f"source: \"{source_filename}\"\n"
+        f"template: \"{clean_name}\"\n"
+        f"---\n\n"
+    )
+
+    md_content = frontmatter + formatted_text
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w", encoding="utf-8")
+    tmp.write(md_content)
+    tmp.close()
+    return tmp.name
 
 # ─── Spec context flow ────────────────────────────────────────────────────────
 
@@ -824,10 +878,10 @@ async def handle_template_selection(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
-    await _run_standard_template(query, context.bot, user_id, template_id, audio_info["path"])
+    await _run_standard_template(query, context.bot, user_id, template_id, audio_info["path"], os.path.splitext(audio_info.get("filename", ""))[0])
 
 
-async def _run_standard_template(query, bot, user_id: str, template_id: str, tmp_path: str):
+async def _run_standard_template(query, bot, user_id: str, template_id: str, tmp_path: str, source_filename: str = ""):
     template = TEMPLATES[template_id]
     loop = asyncio.get_event_loop()
     try:
@@ -867,7 +921,7 @@ async def _run_standard_template(query, bot, user_id: str, template_id: str, tmp
             formatted = transcript
 
         await query.edit_message_text(f"✅ Готово! Шаблон: {template['name']}")
-        await deliver_result(query.message.chat_id, bot, user_id, template_id, transcript, formatted)
+        await deliver_result(query.message.chat_id, bot, user_id, template_id, transcript, formatted, source_filename)
 
     except Exception as exc:
         logger.exception("Error processing audio")
@@ -933,12 +987,14 @@ async def handle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏳ Генерирую DOCX…")
         docx_path = None
         try:
-            docx_path = create_docx(result["template_name"], result["formatted"])
+            src_fn = result.get("source_filename", "")
+            docx_path = create_docx(result["template_name"], result["formatted"], src_fn)
+            docx_name = f"{src_fn} — {result['template_name']}.docx" if src_fn else f"{result['template_name']}.docx"
             with open(docx_path, "rb") as f:
                 await context.bot.send_document(
                     chat_id=query.message.chat_id,
                     document=f,
-                    filename=f"{result['template_name']}.docx",
+                    filename=docx_name,
                 )
             await query.edit_message_text("✅ DOCX готов")
         except Exception as exc:
@@ -951,6 +1007,30 @@ async def handle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except OSError:
                     pass
 
+    # ── Markdown ──
+    elif action == "md":
+        await query.edit_message_text("⏳ Генерирую Markdown…")
+        md_path = None
+        try:
+            src_fn = result.get("source_filename", "")
+            md_path = create_md(result["template_id"], result["template_name"], result["formatted"], src_fn)
+            md_name = f"{src_fn} — {result['template_name']}.md" if src_fn else f"{result['template_name']}.md"
+            with open(md_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=f,
+                    filename=md_name,
+                )
+            await query.edit_message_text("✅ Markdown готов — открывай в Obsidian")
+        except Exception as exc:
+            logger.exception("MD generation failed")
+            await query.edit_message_text(f"❌ Ошибка генерации MD: {exc}")
+        finally:
+            if md_path:
+                try:
+                    os.unlink(md_path)
+                except OSError:
+                    pass
 
 
 async def handle_reformat_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
