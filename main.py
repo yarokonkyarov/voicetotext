@@ -28,6 +28,13 @@ from telegram.ext import (
 from deepgram import DeepgramClient, DeepgramClientOptions, PrerecordedOptions, FileSource
 import anthropic
 from pyrogram import Client as PyroClient
+from todoist_integration import (
+    TODOIST_ENABLED_TEMPLATES,
+    TODOIST_PROMPT_SUFFIX,
+    extract_action_items,
+    build_todoist_button,
+    todoist_callback,
+)
 
 load_dotenv()
 
@@ -529,12 +536,19 @@ def format_with_claude(template_id: str, transcript: str, custom_context: Option
     else:
         prompt = TEMPLATE_PROMPTS[template_id].format(transcript=transcript)
 
+    if template_id in TODOIST_ENABLED_TEMPLATES:
+        prompt += TODOIST_PROMPT_SUFFIX
+
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=8096,
         messages=[{"role": "user", "content": prompt}],
     )
-    return response.content[0].text
+    raw_text = response.content[0].text
+    clean_text, tasks = extract_action_items(raw_text)
+    # tasks передаётся наружу через атрибут функции (простой способ без рефакторинга)
+    format_with_claude._last_tasks = tasks
+    return clean_text
 
 
 def create_docx(template_name: str, formatted_text: str, source_filename: str = "") -> str:
@@ -581,9 +595,11 @@ async def deliver_result(
     transcript: str,
     formatted: str,
     source_filename: str = "",
+    tasks: list = None,
 ):
     """Send formatted result and store it with action buttons."""
     template_name = TEMPLATES[template_id]["name"]
+    tasks = tasks or []
 
     last_result[user_id] = {
         "transcript": transcript,
@@ -599,10 +615,23 @@ async def deliver_result(
     header_parts.append("─" * 32)
     header = "\n".join(header_parts) + "\n\n"
     await send_long_message(chat_id=chat_id, text=header + formatted, bot=bot)
+
+    # Строим клавиатуру с опциональной кнопкой Todoist
+    kb_rows = [
+        [InlineKeyboardButton("🔄 Другой шаблон", callback_data=f"action:reformat:{user_id}")],
+        [
+            InlineKeyboardButton("📄 DOCX", callback_data=f"action:docx:{user_id}"),
+            InlineKeyboardButton("📝 Markdown", callback_data=f"action:md:{user_id}"),
+        ],
+    ]
+    todoist_btn = build_todoist_button(tasks, source=source_filename)
+    if todoist_btn:
+        kb_rows.append([todoist_btn])
+
     await bot.send_message(
         chat_id=chat_id,
         text="Действия с результатом:",
-        reply_markup=build_action_keyboard(user_id),
+        reply_markup=InlineKeyboardMarkup(kb_rows),
     )
 
 
@@ -910,9 +939,11 @@ async def _run_standard_template(query, bot, user_id: str, template_id: str, tmp
             f"✅ Транскрипция готова ({len(transcript)} символов)\n⏳ Форматирую…"
         )
 
+        tasks = []
         if ANTHROPIC_API_KEY:
             try:
                 formatted = await loop.run_in_executor(None, format_with_claude, template_id, transcript)
+                tasks = getattr(format_with_claude, '_last_tasks', [])
             except Exception as e:
                 logger.exception("Claude failed")
                 await bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ Claude ошибка: {e}\n\nСырой транскрипт:")
@@ -921,7 +952,7 @@ async def _run_standard_template(query, bot, user_id: str, template_id: str, tmp
             formatted = transcript
 
         await query.edit_message_text(f"✅ Готово! Шаблон: {template['name']}")
-        await deliver_result(query.message.chat_id, bot, user_id, template_id, transcript, formatted, source_filename)
+        await deliver_result(query.message.chat_id, bot, user_id, template_id, transcript, formatted, source_filename, tasks)
 
     except Exception as exc:
         logger.exception("Error processing audio")
@@ -1099,6 +1130,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_reformat_selection, pattern=r"^retpl:"))
     app.add_handler(CallbackQueryHandler(handle_spec_skip, pattern=r"^spec_skip:"))
     app.add_handler(CallbackQueryHandler(handle_action, pattern=r"^action:"))
+    app.add_handler(CallbackQueryHandler(todoist_callback, pattern=r"^todoist:"))
 
     logger.info("Bot is running…")
     app.run_polling(
