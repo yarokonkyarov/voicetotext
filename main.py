@@ -49,6 +49,8 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "8b296b68246aaa4e5468512f972a4d
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+SECOND_BRAIN_URL = os.getenv("SECOND_BRAIN_URL", "")
+SECOND_BRAIN_API_KEY = os.getenv("SECOND_BRAIN_API_KEY", "")
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
@@ -587,6 +589,43 @@ def create_docx(template_name: str, formatted_text: str, source_filename: str = 
 # ─── Result delivery ──────────────────────────────────────────────────────────
 
 
+async def send_to_second_brain(
+    template_id: str,
+    template_name: str,
+    transcript: str,
+    formatted: str,
+    source_filename: str,
+    tasks: list,
+):
+    """Отправляет результат в second-brain (Obsidian vault). Ошибки не критичны."""
+    if not (SECOND_BRAIN_URL and SECOND_BRAIN_API_KEY):
+        return
+    clean_name = template_name.lstrip("📋📞✉️🎯📐🔖📝 ")
+    payload = {
+        "source": "voicetotext",
+        "title": f"{clean_name} — {source_filename}" if source_filename else clean_name,
+        "text": formatted,
+        "raw_text": transcript,
+        "tags": ["voicetotext"] + TEMPLATE_TAGS.get(template_id, []),
+        "tasks": [
+            t["text"] + (f" (@{t['owner']})" if t.get("owner") else "")
+            for t in tasks
+            if t.get("text")
+        ],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{SECOND_BRAIN_URL}/ingest",
+                json=payload,
+                headers={"X-API-Key": SECOND_BRAIN_API_KEY},
+            )
+            resp.raise_for_status()
+            logger.info("second-brain: сохранено в %s", resp.json().get("note_path"))
+    except Exception as e:
+        logger.error("second-brain ingest failed: %s", e)
+
+
 async def deliver_result(
     chat_id: int,
     bot,
@@ -600,6 +639,12 @@ async def deliver_result(
     """Send formatted result and store it with action buttons."""
     template_name = TEMPLATES[template_id]["name"]
     tasks = tasks or []
+
+    asyncio.create_task(
+        send_to_second_brain(
+            template_id, template_name, transcript, formatted, source_filename, tasks
+        )
+    )
 
     last_result[user_id] = {
         "transcript": transcript,
