@@ -24,7 +24,7 @@ import uuid
 import logging
 
 import httpx
-from telegram import InlineKeyboardButton
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 log = logging.getLogger(__name__)
@@ -247,8 +247,17 @@ async def todoist_callback(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         text = "❌ Не удалось добавить задачи.\n" + "\n".join(result["errors"][:3])
 
+    # Убираем только кнопку Todoist (повторный пуш задвоил бы задачи) —
+    # остальные действия (DOCX/MD/шаблон) остаются доступными
     try:
-        await query.edit_message_reply_markup(reply_markup=None)
+        rows = [
+            [b for b in row if not (b.callback_data or "").startswith("todoist:")]
+            for row in query.message.reply_markup.inline_keyboard
+        ]
+        rows = [r for r in rows if r]
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None
+        )
     except Exception:
         pass
     await query.message.reply_text(text)

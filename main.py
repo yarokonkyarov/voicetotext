@@ -1115,9 +1115,8 @@ async def handle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_template_keyboard(user_id, prefix="retpl"),
         )
 
-    # ── DOCX ──
+    # ── DOCX ── (кнопки остаются — можно жать несколько действий подряд)
     elif action == "docx":
-        await query.edit_message_text("⏳ Генерирую DOCX…")
         docx_path = None
         try:
             src_fn = result.get("source_filename", "")
@@ -1129,10 +1128,9 @@ async def handle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     document=f,
                     filename=docx_name,
                 )
-            await query.edit_message_text("✅ DOCX готов")
         except Exception as exc:
             logger.exception("DOCX generation failed")
-            await query.edit_message_text(f"❌ Ошибка генерации DOCX: {exc}")
+            await query.message.reply_text(f"❌ Ошибка генерации DOCX: {exc}")
         finally:
             if docx_path:
                 try:
@@ -1140,9 +1138,8 @@ async def handle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except OSError:
                     pass
 
-    # ── Markdown ──
+    # ── Markdown ── (кнопки остаются)
     elif action == "md":
-        await query.edit_message_text("⏳ Генерирую Markdown…")
         md_path = None
         try:
             src_fn = result.get("source_filename", "")
@@ -1154,10 +1151,9 @@ async def handle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     document=f,
                     filename=md_name,
                 )
-            await query.edit_message_text("✅ Markdown готов — открывай в Obsidian")
         except Exception as exc:
             logger.exception("MD generation failed")
-            await query.edit_message_text(f"❌ Ошибка генерации MD: {exc}")
+            await query.message.reply_text(f"❌ Ошибка генерации MD: {exc}")
         finally:
             if md_path:
                 try:
