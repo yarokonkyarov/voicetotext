@@ -6,3 +6,6 @@ venv/
 *.sqlite3
 *.db
 .DS_Store
+
+voicetotext_dl.session
+voicetotext_dl.session-journal
