@@ -51,6 +51,9 @@ TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 SECOND_BRAIN_URL = os.getenv("SECOND_BRAIN_URL", "")
 SECOND_BRAIN_API_KEY = os.getenv("SECOND_BRAIN_API_KEY", "")
+# plaud-processor: текст/txt/md уходят туда (общий бот, поллер у plaud выключен)
+PLAUD_PROCESSOR_URL = os.getenv("PLAUD_PROCESSOR_URL", "")
+PLAUD_WEBHOOK_SECRET = os.getenv("PLAUD_WEBHOOK_SECRET", "")
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
@@ -626,6 +629,28 @@ async def send_to_second_brain(
         logger.error("second-brain ingest failed: %s", e)
 
 
+async def forward_to_plaud(transcript: str, source: str) -> bool:
+    """Пересылает расшифровку в plaud-processor (пайплайн задач). True — принято."""
+    if not PLAUD_PROCESSOR_URL:
+        return False
+    payload = {
+        "transcript": transcript,
+        "recording_id": f"tg-{source}-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "timestamp": datetime.now().astimezone().isoformat(),
+    }
+    headers = {"X-Webhook-Secret": PLAUD_WEBHOOK_SECRET} if PLAUD_WEBHOOK_SECRET else {}
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{PLAUD_PROCESSOR_URL}/webhook/plaud", json=payload, headers=headers,
+            )
+            resp.raise_for_status()
+            return True
+    except Exception as e:
+        logger.error("plaud-processor forward failed: %s", e)
+        return False
+
+
 async def deliver_result(
     chat_id: int,
     bot,
@@ -895,7 +920,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text: spec context input or email address input."""
+    """Handle text: spec context input, иначе — транскрипт для plaud-processor."""
     user_id = str(update.effective_user.id)
     text = update.message.text.strip()
 
@@ -912,6 +937,38 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    # Свободный текст = готовая расшифровка (Plaud) → пайплайн задач
+    if PLAUD_PROCESSOR_URL:
+        status = await update.message.reply_text("⏳ Разбираю расшифровку на задачи…")
+        ok = await forward_to_plaud(text, str(update.message.message_id))
+        if ok:
+            await status.delete()
+        else:
+            await status.edit_text("❌ Не удалось обработать текст (plaud-processor недоступен).")
+
+
+async def handle_transcript_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Файл .txt/.md = готовая расшифровка (Plaud) → пайплайн задач."""
+    doc = update.message.document
+    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+        await update.message.reply_text("❌ Файл слишком большой (лимит 5 МБ).")
+        return
+    status = await update.message.reply_text("⏳ Разбираю расшифровку на задачи…")
+    try:
+        tg_file = await doc.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+        text = raw.decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.error("transcript file download failed: %s", e)
+        await status.edit_text(f"❌ Не удалось скачать файл: {e}")
+        return
+    caption = (update.message.caption or "").strip()
+    full_text = f"{caption}\n\n{text}" if caption else text
+    ok = await forward_to_plaud(full_text, doc.file_name or str(update.message.message_id))
+    if ok:
+        await status.delete()
+    else:
+        await status.edit_text("❌ Не удалось обработать файл (plaud-processor недоступен).")
 
 
 async def handle_template_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1171,6 +1228,10 @@ def main():
         handle_audio,
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    app.add_handler(MessageHandler(
+        filters.Document.FileExtension("txt") | filters.Document.FileExtension("md"),
+        handle_transcript_file,
+    ))
     app.add_handler(CallbackQueryHandler(handle_template_selection, pattern=r"^tpl:"))
     app.add_handler(CallbackQueryHandler(handle_reformat_selection, pattern=r"^retpl:"))
     app.add_handler(CallbackQueryHandler(handle_spec_skip, pattern=r"^spec_skip:"))
