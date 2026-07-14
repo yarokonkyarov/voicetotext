@@ -1212,6 +1212,35 @@ async def handle_reformat_selection(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text(f"❌ Ошибка: {exc}")
 
 
+async def handle_second_brain_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки привязки заметки к встрече (шлёт second-brain, решает он же)."""
+    query = update.callback_query
+    await query.answer()
+    if not (SECOND_BRAIN_URL and SECOND_BRAIN_API_KEY):
+        await query.edit_message_text("❌ second-brain не настроен.")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{SECOND_BRAIN_URL}/link-action",
+                json={"data": query.data},
+                headers={"X-API-Key": SECOND_BRAIN_API_KEY},
+            )
+            resp.raise_for_status()
+            result = resp.json()
+    except Exception as exc:
+        logger.exception("second-brain link-action failed")
+        await query.edit_message_text(f"❌ Ошибка привязки: {exc}")
+        return
+    markup = None
+    if result.get("button"):
+        b = result["button"]
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(b["text"], callback_data=b["callback_data"])
+        ]])
+    await query.edit_message_text(result.get("text", "Готово."), reply_markup=markup)
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 
@@ -1233,6 +1262,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_spec_skip, pattern=r"^spec_skip:"))
     app.add_handler(CallbackQueryHandler(handle_action, pattern=r"^action:"))
     app.add_handler(CallbackQueryHandler(todoist_callback, pattern=r"^todoist:"))
+    app.add_handler(CallbackQueryHandler(handle_second_brain_link, pattern=r"^sb(lk|mv):"))
 
     logger.info("Bot is running…")
     app.run_polling(
