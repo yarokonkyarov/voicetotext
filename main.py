@@ -1272,15 +1272,17 @@ async def handle_applaud_webhook(request: web.Request) -> web.Response:
 
     payload = json.loads(raw_body)
     event = payload.get("event")
-    if event != "transcript_ready":
+    # Своя транскрипция через Deepgram сразу на audio_ready — не ждём, пока
+    # Plaud сам расшифрует запись на своей стороне (может занимать долго).
+    # transcript_ready специально игнорируется, иначе получим дубль заметки.
+    if event != "audio_ready":
         return web.Response(status=200, text="ignored")
 
-    content = payload.get("content") or {}
-    transcript = (content.get("transcript_text") or "").strip()
     recording = payload.get("recording") or {}
-    if not transcript:
-        logger.info("applaud webhook: transcript_ready без текста, пропуск (%s)", recording.get("id"))
-        return web.Response(status=200, text="empty transcript")
+    audio_url = (payload.get("http_urls") or {}).get("audio")
+    if not audio_url:
+        logger.warning("applaud webhook: audio_ready без http_urls.audio (%s)", recording.get("id"))
+        return web.Response(status=200, text="no audio url")
 
     if not MY_CHAT_ID:
         logger.error("applaud webhook: MY_CHAT_ID не задан, некуда доставить результат")
@@ -1293,17 +1295,50 @@ async def handle_applaud_webhook(request: web.Request) -> web.Response:
 
     bot = request.app["bot"]
     chat_id = int(MY_CHAT_ID)
-    logger.info("applaud webhook: transcript_ready «%s» (%d символов)", title, len(transcript))
+    logger.info("applaud webhook: audio_ready «%s», скачиваю и транскрибирую", title)
 
     async def process():
+        tmp_path = None
+        compressed_path = None
         try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.get(audio_url)
+                resp.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+            tmp.write(resp.content)
+            tmp.close()
+            tmp_path = tmp.name
+
             loop = asyncio.get_event_loop()
+            # Тот же путь, что и для обычной загрузки в бота: ffmpeg-сжатие
+            # перед Deepgram (extract_audio), а не сырой файл от applaud.
+            try:
+                compressed_path = await loop.run_in_executor(None, extract_audio, tmp_path)
+            except Exception:
+                logger.warning("applaud webhook: extract_audio упал, транскрибирую как есть")
+                compressed_path = tmp_path
+
+            transcript = await loop.run_in_executor(None, transcribe_audio, compressed_path)
+            if not transcript.strip():
+                logger.info("applaud webhook: Deepgram не распознал речь (%s)", recording.get("id"))
+                return
+
             formatted = await loop.run_in_executor(None, format_with_claude, "meeting", transcript)
             tasks = getattr(format_with_claude, "_last_tasks", [])
         except Exception:
-            logger.exception("applaud webhook: Claude formatting failed")
-            formatted = transcript
-            tasks = []
+            logger.exception("applaud webhook: обработка аудио упала")
+            return
+        finally:
+            if compressed_path and compressed_path != tmp_path:
+                try:
+                    os.unlink(compressed_path)
+                except OSError:
+                    pass
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
         await deliver_result(chat_id, bot, "applaud", "meeting", transcript, formatted, source_filename, tasks)
 
     asyncio.create_task(process())
