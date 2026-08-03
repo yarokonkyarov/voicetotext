@@ -5,14 +5,18 @@ Transcribes MP3/WAV audio via Deepgram and formats using PLAUD-style templates.
 """
 
 import asyncio
+import hashlib
+import hmac
+import json
 import os
 import logging
 import tempfile
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import httpx
 from typing import Dict, Any, Optional
 
+from aiohttp import web
 from docx import Document
 from docx.shared import Pt
 from dotenv import load_dotenv
@@ -54,6 +58,13 @@ SECOND_BRAIN_API_KEY = os.getenv("SECOND_BRAIN_API_KEY", "")
 # plaud-processor: текст/txt/md уходят туда (общий бот, поллер у plaud выключен)
 PLAUD_PROCESSOR_URL = os.getenv("PLAUD_PROCESSOR_URL", "")
 PLAUD_WEBHOOK_SECRET = os.getenv("PLAUD_WEBHOOK_SECRET", "")
+
+# applaud (self-hosted Plaud-девайс синк) шлёт сюда transcript_ready вебхуки —
+# запись готова, минуя ручную отправку файла в Telegram
+MY_CHAT_ID = os.getenv("MY_CHAT_ID", "")
+APPLAUD_WEBHOOK_SECRET = os.getenv("APPLAUD_WEBHOOK_SECRET", "")
+APPLAUD_WEBHOOK_PORT = int(os.getenv("APPLAUD_WEBHOOK_PORT", "8020"))
+MSK = timezone(timedelta(hours=3))
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
@@ -1241,38 +1252,125 @@ async def handle_second_brain_link(update: Update, context: ContextTypes.DEFAULT
     await query.edit_message_text(result.get("text", "Готово."), reply_markup=markup)
 
 
+# ─── Applaud webhook (Plaud-девайс, без Telegram) ──────────────────────────────
+
+
+def _verify_applaud_signature(raw_body: bytes, header: str) -> bool:
+    if not APPLAUD_WEBHOOK_SECRET:
+        return True  # секрет не настроен в applaud — как и он сам, не подписываем
+    expected = "sha256=" + hmac.new(
+        APPLAUD_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(header or "", expected)
+
+
+async def handle_applaud_webhook(request: web.Request) -> web.Response:
+    raw_body = await request.read()
+    if not _verify_applaud_signature(raw_body, request.headers.get("X-Applaud-Signature", "")):
+        logger.warning("applaud webhook: bad signature")
+        return web.Response(status=401, text="bad signature")
+
+    payload = json.loads(raw_body)
+    event = payload.get("event")
+    if event != "transcript_ready":
+        return web.Response(status=200, text="ignored")
+
+    content = payload.get("content") or {}
+    transcript = (content.get("transcript_text") or "").strip()
+    recording = payload.get("recording") or {}
+    if not transcript:
+        logger.info("applaud webhook: transcript_ready без текста, пропуск (%s)", recording.get("id"))
+        return web.Response(status=200, text="empty transcript")
+
+    if not MY_CHAT_ID:
+        logger.error("applaud webhook: MY_CHAT_ID не задан, некуда доставить результат")
+        return web.Response(status=500, text="MY_CHAT_ID not configured")
+
+    start_ms = recording.get("start_time_ms")
+    start_dt = datetime.fromtimestamp(start_ms / 1000, tz=MSK) if start_ms else datetime.now(MSK)
+    title = recording.get("filename") or "Plaud recording"
+    source_filename = f"{start_dt:%Y-%m-%d_%H_%M_%S} {title}"
+
+    bot = request.app["bot"]
+    chat_id = int(MY_CHAT_ID)
+    logger.info("applaud webhook: transcript_ready «%s» (%d символов)", title, len(transcript))
+
+    async def process():
+        try:
+            loop = asyncio.get_event_loop()
+            formatted = await loop.run_in_executor(None, format_with_claude, "meeting", transcript)
+            tasks = getattr(format_with_claude, "_last_tasks", [])
+        except Exception:
+            logger.exception("applaud webhook: Claude formatting failed")
+            formatted = transcript
+            tasks = []
+        await deliver_result(chat_id, bot, "applaud", "meeting", transcript, formatted, source_filename, tasks)
+
+    asyncio.create_task(process())
+    return web.Response(status=200, text="accepted")
+
+
+async def start_webhook_server(bot) -> web.AppRunner:
+    webapp = web.Application()
+    webapp["bot"] = bot
+    webapp.router.add_post("/webhook/applaud", handle_applaud_webhook)
+    runner = web.AppRunner(webapp)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", APPLAUD_WEBHOOK_PORT)
+    await site.start()
+    logger.info("Applaud webhook listening on 127.0.0.1:%d/webhook/applaud", APPLAUD_WEBHOOK_PORT)
+    return runner
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 
-def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+async def run():
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(MessageHandler(
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(MessageHandler(
         filters.AUDIO | filters.VOICE | filters.VIDEO | filters.Document.AUDIO | filters.Document.VIDEO,
         handle_audio,
     ))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    app.add_handler(MessageHandler(
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_handler(MessageHandler(
         filters.Document.FileExtension("txt") | filters.Document.FileExtension("md"),
         handle_transcript_file,
     ))
-    app.add_handler(CallbackQueryHandler(handle_template_selection, pattern=r"^tpl:"))
-    app.add_handler(CallbackQueryHandler(handle_reformat_selection, pattern=r"^retpl:"))
-    app.add_handler(CallbackQueryHandler(handle_spec_skip, pattern=r"^spec_skip:"))
-    app.add_handler(CallbackQueryHandler(handle_action, pattern=r"^action:"))
-    app.add_handler(CallbackQueryHandler(todoist_callback, pattern=r"^todoist:"))
-    app.add_handler(CallbackQueryHandler(handle_second_brain_link, pattern=r"^sb(lk|mv):"))
+    application.add_handler(CallbackQueryHandler(handle_template_selection, pattern=r"^tpl:"))
+    application.add_handler(CallbackQueryHandler(handle_reformat_selection, pattern=r"^retpl:"))
+    application.add_handler(CallbackQueryHandler(handle_spec_skip, pattern=r"^spec_skip:"))
+    application.add_handler(CallbackQueryHandler(handle_action, pattern=r"^action:"))
+    application.add_handler(CallbackQueryHandler(todoist_callback, pattern=r"^todoist:"))
+    application.add_handler(CallbackQueryHandler(handle_second_brain_link, pattern=r"^sb(lk|mv):"))
+
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY],
+    )
+
+    webhook_runner = await start_webhook_server(application.bot)
 
     logger.info("Bot is running…")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=[
-            Update.MESSAGE,
-            Update.CALLBACK_QUERY,
-        ],
-    )
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    try:
+        import signal
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop_event.set)
+    except (NotImplementedError, ImportError):
+        pass
+
+    await stop_event.wait()
+
+    await webhook_runner.cleanup()
+    await application.updater.stop()
+    await application.stop()
+    await application.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
